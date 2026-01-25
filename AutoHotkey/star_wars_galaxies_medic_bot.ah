@@ -1,0 +1,437 @@
+#Requires AutoHotkey v2.0
+#SingleInstance Force
+SetTitleMatchMode 2
+CoordMode "Mouse", "Client"
+
+; =============================
+; CONFIG
+; =============================
+
+launcherTaskName := "SWGLegendsLauncherElevated"
+
+launcherTitle := "SWGLegends Launcher"
+gameTitle     := "Star Wars Galaxies"
+
+launcherProc := "javaw.exe"
+gameProc     := "SwgClient_r.exe"
+
+; Discord webhook
+discordWebhook := "https://discord.com/api/webhooks/insertyourwebhookhere"
+
+; Discord role mention (optional)
+discordRolePing := "<@&INSERTROLEIDHERE>"
+
+; =============================
+; TIMINGS (ms)
+; =============================
+
+launcherLoadWait        := 30000
+launcherUpdateCheckWait := 30000
+launcherPatchWait       := 180000
+
+clientStartupWait       := 60000
+worldLoadWait           := 30000
+
+watchdogInterval        := 30000
+
+standardBackoff         := 600000   ; 10 minutes
+extendedBackoff         := 900000   ; 15 minutes
+
+launcherWindowTimeout   := 90000
+gameWindowTimeout       := 120000
+
+heartbeatInterval       := 14400000 ; 4 hours
+
+maxRapidFailures        := 3
+rapidFailureWindowMs    := 300000
+
+; =============================
+; UI
+; =============================
+
+launcherLoginBtn := [205, 381]
+launcherPlayBtn  := [835, 531]
+
+characterDownCount := 2
+afkHotkey := "="
+
+; =============================
+; STATE
+; =============================
+
+lastAttemptTick := 0
+rapidFailures   := 0
+
+sessionStartTick := 0
+lastUptimeMs     := 0
+
+armedFile := A_ScriptDir "\armed.sent"
+
+; State machine
+lastHealthState := "UNKNOWN"  ; ONLINE / OFFLINE / HUNG / ERROR
+lastHeartbeatSentTick := 0
+onlineMsgSentForSession := false
+
+; =============================
+; DISCORD
+; =============================
+
+SendDiscord(msg) {
+    global discordWebhook
+    if (discordWebhook = "")
+        return
+
+    try {
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+        http.Open("POST", discordWebhook, false)
+        http.SetRequestHeader("Content-Type", "application/json")
+
+        safe := msg
+
+        ; Escape backslashes
+        safe := StrReplace(safe, "\", "\\")
+
+        ; Escape quotes (")
+        safe := StrReplace(safe, Chr(34), "\" . Chr(34))
+
+        ; IMPORTANT: use backtick escapes, not literal newlines
+        safe := StrReplace(safe, "`r", "")
+        safe := StrReplace(safe, "`n", "\n")
+
+        ; Build JSON like your original working block
+        payload := '{ "content": "' . safe . '" }'
+        http.Send(payload)
+    }
+}
+
+; =============================
+; ARMED MESSAGE (SUPPRESSED)
+; =============================
+
+SendArmedOncePerDay() {
+    global armedFile
+
+    try {
+        if FileExist(armedFile) {
+            ; AHK v2: FileGetTime(FileName, WhichTime)
+            t := FileGetTime(armedFile, "M")  ; returns YYYYMMDDHH24MISS
+            ; Compare days by substring (YYYYMMDD)
+            if (SubStr(A_Now, 1, 8) = SubStr(t, 1, 8))
+                return
+        }
+
+        ; overwrite instead of append (avoid file growing)
+        FileDelete armedFile
+        FileAppend A_Now, armedFile
+
+        SendDiscord("🟡 Bot script is armed. Waiting for online confirmation.")
+    } catch {
+        ; If file ops fail, still arm once
+        SendDiscord("🟡 Bot script is armed. Waiting for online confirmation.")
+    }
+}
+
+; =============================
+; HELPERS
+; =============================
+
+WaitAndActivate(title, timeout := 60000) {
+    WinWait title, , timeout
+    WinActivate title
+    WinWaitActive title, , timeout
+    Sleep 1500
+}
+
+ClickAtClient(x, y, delay := 300) {
+    MouseMove x, y
+    Sleep delay
+    Click
+    Sleep delay
+}
+
+HardReset(reason := "") {
+    global launcherProc, gameProc
+    global sessionStartTick, lastUptimeMs
+    global lastHealthState, onlineMsgSentForSession
+
+    if (sessionStartTick > 0)
+        lastUptimeMs := A_TickCount - sessionStartTick
+
+    sessionStartTick := 0
+    onlineMsgSentForSession := false
+    lastHealthState := "OFFLINE"
+
+    try ProcessClose gameProc
+    try ProcessClose launcherProc
+    Sleep 5000
+}
+
+RunLauncherElevated() {
+    global launcherTaskName
+    Run 'schtasks /run /tn "' launcherTaskName '"', , "Hide"
+}
+
+; =============================
+; HEALTH CHECKS
+; =============================
+
+IsWindowHung(hwnd) {
+    return DllCall("user32\IsHungAppWindow", "ptr", hwnd, "int")
+}
+
+GetGameHwnd() {
+    global gameTitle
+    try return WinExist(gameTitle)
+    return 0
+}
+
+; Wider dialog detection:
+; - Any #32770 dialog, optionally owned by swg client OR containing common error keywords.
+FindLikelyGameErrorDialog() {
+    global gameProc
+
+    for hwnd in WinGetList() {
+        try {
+            if (WinGetClass(hwnd) != "#32770")
+                continue
+
+            title := WinGetTitle(hwnd)
+            if (title = "")
+                continue
+
+            ; keyword heuristics (tune later if needed)
+            if (InStr(title, "Error") || InStr(title, "Disconnected") || InStr(title, "Exception") || InStr(title, "SWG") || InStr(title, "Galaxies")) {
+                return hwnd
+            }
+
+            ; also accept dialogs owned by SwgClient_r.exe if possible
+            pid := WinGetPID(hwnd)
+            if (pid) {
+                try {
+                    if (ProcessGetName(pid) = gameProc)
+                        return hwnd
+                } catch {
+                    ; ignore
+                }
+            }
+        } catch {
+            ; ignore
+        }
+    }
+    return 0
+}
+
+CloseDialog(hwnd) {
+    try {
+        WinActivate("ahk_id " hwnd)
+        Sleep 250
+        Send "!{F4}"
+        Sleep 750
+        if WinExist("ahk_id " hwnd)
+            WinClose("ahk_id " hwnd)
+    }
+}
+
+; Return one of: ONLINE / OFFLINE / HUNG / ERROR
+GetHealthState() {
+    global gameProc
+
+    if !ProcessExist(gameProc)
+        return "OFFLINE"
+
+    dlg := FindLikelyGameErrorDialog()
+    if (dlg)
+        return "ERROR"
+
+    hwnd := GetGameHwnd()
+    if (hwnd && IsWindowHung(hwnd))
+        return "HUNG"
+
+    ; Process exists; if window doesn't exist, still treat as ONLINE-ish (can happen during zone loads)
+    return "ONLINE"
+}
+
+; =============================
+; HEARTBEAT (TIMER-DRIVEN)
+; =============================
+
+HeartbeatTick() {
+    global sessionStartTick, lastHealthState, heartbeatInterval
+
+    state := GetHealthState()
+
+    ; Session uptime only makes sense if we think we're online
+    uptimeLine := ""
+    if (sessionStartTick > 0) {
+        mins := Floor((A_TickCount - sessionStartTick) / 60000)
+        uptimeLine := "`nSession uptime: **" mins " min**"
+    }
+
+    statusLine := ""
+    if (state = "ONLINE")
+        statusLine := "🟢 ONLINE"
+    else if (state = "HUNG")
+        statusLine := "🟠 HUNG"
+    else if (state = "ERROR")
+        statusLine := "🟡 ERROR DIALOG"
+    else
+        statusLine := "🔴 OFFLINE"
+
+    SendDiscord("💓 **Heartbeat**`nStatus: **" statusLine "**" uptimeLine)
+}
+
+; =============================
+; LAUNCHER FLOW
+; =============================
+
+HandleLauncher() {
+    global launcherTitle, launcherLoginBtn, launcherPlayBtn
+    global launcherLoadWait, launcherUpdateCheckWait, launcherPatchWait
+    global launcherWindowTimeout
+
+    WaitAndActivate launcherTitle, launcherWindowTimeout
+    Sleep launcherLoadWait
+    ClickAtClient launcherLoginBtn[1], launcherLoginBtn[2]
+    Sleep launcherUpdateCheckWait
+    ClickAtClient launcherPlayBtn[1], launcherPlayBtn[2]
+    Sleep launcherPatchWait
+    ClickAtClient launcherPlayBtn[1], launcherPlayBtn[2]
+}
+
+; =============================
+; GAME LOGIN FLOW
+; =============================
+
+HandleGameLogin() {
+    global gameTitle, clientStartupWait, worldLoadWait
+    global characterDownCount, gameWindowTimeout
+    global sessionStartTick
+
+    WaitAndActivate gameTitle, gameWindowTimeout
+    Sleep clientStartupWait
+
+    Loop characterDownCount {
+        Send "{Down}"
+        Sleep 300
+    }
+    Send "{Enter}"
+
+    Sleep worldLoadWait
+    WinActivate gameTitle
+    Sleep 500
+    SendInput "{=}"
+
+    sessionStartTick := A_TickCount
+}
+
+; =============================
+; MAIN LOOP
+; =============================
+
+Main() {
+    global gameProc, watchdogInterval
+    global lastAttemptTick, rapidFailures
+    global maxRapidFailures, rapidFailureWindowMs
+    global standardBackoff, extendedBackoff
+    global sessionStartTick, lastUptimeMs
+    global lastHealthState, onlineMsgSentForSession
+    global discordRolePing
+
+    SendArmedOncePerDay()
+
+    ; Start heartbeat timer
+    SetTimer HeartbeatTick, heartbeatInterval
+
+    Loop {
+        state := GetHealthState()
+
+        ; --- State transition notifications (only when state changes) ---
+        if (state != lastHealthState) {
+
+            ; If we just became ONLINE, send the ONLINE message once per session
+            if (state = "ONLINE") {
+                if (!onlineMsgSentForSession) {
+                    onlineMsgSentForSession := true
+
+                    if (sessionStartTick = 0)
+                        sessionStartTick := A_TickCount
+
+                    if (lastUptimeMs > 0) {
+                        mins := Floor(lastUptimeMs / 60000)
+                        SendDiscord("🟢 Character **INSERTCHARACTERNAME** logged in, macro running.`nPrevious uptime: **" mins " min**")
+                        lastUptimeMs := 0
+                    } else {
+                        SendDiscord("🟢 Character **INSERTCHARACTERNAME** logged in, macro running.")
+                    }
+                }
+            }
+
+            ; If we transitioned into bad states, notify
+            if (state = "ERROR") {
+                SendDiscord(discordRolePing " ⚠️ Detected game error dialog. Server may be restarting... Waiting 10 minutes before new login attempt is made.")
+            } else if (state = "HUNG") {
+                SendDiscord(discordRolePing " ⚠️ Detected hung game window. Local game may have crashed... Waiting 10 minutes before new login attempt is made.")
+            } else if (state = "OFFLINE") {
+                SendDiscord(discordRolePing " 🔄 Detected offline client. Attempting process reset.")
+            }
+
+            lastHealthState := state
+        }
+
+        ; --- Act on ERROR / HUNG immediately ---
+        if (state = "ERROR") {
+            dlg := FindLikelyGameErrorDialog()
+            if (dlg)
+                CloseDialog(dlg)
+
+            HardReset("error-dialog")
+            Sleep standardBackoff
+            ; after backoff, loop continues and will attempt relog when OFFLINE
+        }
+
+        if (state = "HUNG") {
+            HardReset("hung")
+            Sleep standardBackoff
+        }
+
+        ; --- Offline recovery loop ---
+        if (state = "OFFLINE") {
+
+            now := A_TickCount
+            if (lastAttemptTick && (now - lastAttemptTick) < rapidFailureWindowMs)
+                rapidFailures++
+            else
+                rapidFailures := 0
+
+            lastAttemptTick := now
+
+            if (rapidFailures >= maxRapidFailures) {
+                SendDiscord(discordRolePing " 🚨 **REPEATED FAILURES**. Waiting 15 minutes before new login attempt is made.")
+                rapidFailures := 0
+                Sleep extendedBackoff
+                continue
+            }
+
+            try {
+                HardReset("offline")
+                RunLauncherElevated()
+                HandleLauncher()
+                HandleGameLogin()
+
+                ; ONLINE message will be sent by state transition when we detect ONLINE
+            } catch as e {
+                SendDiscord(discordRolePing " ⚠️ **SWG Medic Bot error during relog:** " . e.Message)
+                Sleep standardBackoff
+            }
+        }
+
+        Sleep watchdogInterval
+    }
+}
+
+; =============================
+; START
+; =============================
+
+MsgBox "SWG Medic bot starting with Discord alerts and automatic recovery. Click OK to proceed."
+Main()
